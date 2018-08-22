@@ -337,9 +337,9 @@ jobs:
       - config-director
       trigger: true
     - get: pks
-      # params:
-      #   globs: 
-      #   - "pivotal-container-service*"
+       params:
+         globs: 
+         - "pivotal-container-service*"
   - task: copy-om
     config:
       platform: linux
