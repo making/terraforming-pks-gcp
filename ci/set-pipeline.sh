@@ -1,4 +1,9 @@
 #!/bin/sh
-fly -t home sp -p pks-gcp \
-    -c `dirname $0`/pipeline.yml \
-    -l `dirname $0`/credentials.yml
+set -a
+source variables.txt 
+set +a
+brew install gettext
+alias envsubst='/usr/local/Cellar/gettext/*/bin/envsubst'
+envsubst < params.yml.blank > params.yml
+
+fly -t pks set-pipeline -p new-pks -c pipeline.yml -l params.yml -n

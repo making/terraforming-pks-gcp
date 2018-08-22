@@ -337,9 +337,9 @@ jobs:
       - config-director
       trigger: true
     - get: pks
-      params:
-        globs: 
-        - "pks-linux-*"
+      # params:
+      #   globs: 
+      #   - "pivotal-container-service*"
   - task: copy-om
     config:
       platform: linux
@@ -390,6 +390,7 @@ jobs:
           AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
           FILENAME=`basename ${AWS_OBJECT_KEY}`
           DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/${PRODUCT_ID}/download"
+          # HARDCODE DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/190794/download"
 
           cat <<EOF > service-account.json
           ${GCP_SERVICE_ACCOUNT_KEY}
