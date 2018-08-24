@@ -20,7 +20,7 @@ resources:
   source:
     bucket: ((terraform_statefile_bucket))
     json_key: ((gcp_service_account_key))
-    versioned_file: terraform.tfstate
+    versioned_file: terraform.tfstate/
 - name: pks
   type: pivnet
   source:
@@ -76,6 +76,9 @@ jobs:
         - |
           # https://github.com/pivotal-cf/pcf-pipelines/blob/master/install-pcf/gcp/tasks/create-initial-terraform-state/task.sh
           set -eu
+
+          echo $GCP_SERVICE_ACCOUNT_KEY
+          echo $TERRAFORM_STATEFILE_BUCKET
 
           echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
           gcloud auth activate-service-account --key-file=gcloud.key
@@ -337,9 +340,9 @@ jobs:
       - config-director
       trigger: true
     - get: pks
-       params:
-         globs: 
-         - "pivotal-container-service*"
+      params:
+        globs: 
+        - "pivotal-container-service*"
   - task: copy-om
     config:
       platform: linux

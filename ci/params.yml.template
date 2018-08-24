@@ -1,24 +1,22 @@
----
 pivnet_api_token: $PIVNET_API_TOKEN
 terraform_statefile_bucket: $TERRAFORM_BUCKET
 gcp_project_id: $GCP_PROJECT_ID
-pks_env_prefix: gp  # sorry for the overwrapping with tfvars
+pks_env_prefix: $PKS_ENV_PREFIX 
 ops_mgr_usr: admin
 ops_mgr_pwd: p@ssword2018
 om_decryption_pwd: p@ssword2018
 director_vm_type: large.disk
 internet_connected: true
 ops_mgr_trusted_certs: ""
-gcp_service_account_key: | # sorry for the overwrapping with tfvars
-  $GCP_SERVICE_ACCOUNT_KEY
+gcp_service_account_key: | 
+ $GCP_SERVICE_ACCOUNT_KEY
 tfvars: |
-  env_prefix         = "gp"
+  env_prefix       = "$PKS_ENV_PREFIX"
   project          = "$GCP_PROJECT_ID"
   region           = "us-central1"
   zones            = ["us-central1-a", "us-central1-b", "us-central1-c"]
   opsman_image_url = "https://storage.googleapis.com/ops-manager-asia/pcf-gcp-2.0-build.269.tar.gz"
-  service_account_key = <<SERVICE_ACCOUNT_KEY
+  service_account_key = |
   $GCP_SERVICE_ACCOUNT_KEY
-  SERVICE_ACCOUNT_KEY
   nat_machine_type = "f1-micro"
   opsman_machine_type = "n1-standard-1"
