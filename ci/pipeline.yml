@@ -104,13 +104,11 @@ jobs:
     put: terraform-state
     params:
       file:  tfstate-output/terraform.tfstate
-    put: keyval
-    params:
-      file: keyvalout/keyval.properties
   plan:
   - aggregate:
     - get: template
     - get: terraform-state
+
   - task: terraform-apply
     params:
       TFVARS: ((tfvars))
@@ -126,6 +124,7 @@ jobs:
       - name: terraform-state
       outputs:
       - name: tfstate-output
+      - name: keyval
       run:
         path: sh
         args: 
@@ -156,9 +155,12 @@ jobs:
           terraform apply \
                     -state-out tfstate-output/terraform.tfstate \
                     terraform.tfplan
+          export PASSED_opsman_ip=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
           template/ci/scripts/auto_pass_keys.sh
-          PASSED_opsman_ip=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
 
+  - put: keyval
+    params:
+      file: keyvalout/keyval.properties
 
 - name: config-authentication
   build_logs_to_retain: 5
