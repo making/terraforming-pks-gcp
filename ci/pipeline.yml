@@ -9,18 +9,25 @@ resource_types:
   source:
     repository: pivotalcf/pivnet-resource
     tag: latest-final
+- name: keyval
+  type: docker-image
+  source:
+    repository: swce/keyval-resource
+
 
 resources:
 - name: template
   type: git
   source:
-    uri: https://github.com/making/terraforming-pks-gcp
+    uri: https://github.com/dbbaskette/terraforming-pks-gcp
+    branch: master
+    skip_ssl_verification: true
 - name: terraform-state
   type: gcs
   source:
     bucket: ((terraform_statefile_bucket))
     json_key: ((gcp_service_account_key))
-    versioned_file: terraform.tfstate/
+    versioned_file: terraform.tfstate
 - name: pks
   type: pivnet
   source:
@@ -33,6 +40,8 @@ resources:
     api_token: ((pivnet_api_token))
     product_slug: stemcells
     product_version: 3468\..*
+- name: keyval
+  type: keyval
 
 groups:
 - name: pks
@@ -55,7 +64,6 @@ groups:
 
 jobs:
 - name: bootstrap-terraform-state
-  build_logs_to_retain: 5
   serial: true
   plan:
   - task: create-terraform-state
@@ -68,7 +76,6 @@ jobs:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       run:
         path: bash
         args: 
@@ -76,15 +83,9 @@ jobs:
         - |
           # https://github.com/pivotal-cf/pcf-pipelines/blob/master/install-pcf/gcp/tasks/create-initial-terraform-state/task.sh
           set -eu
-
-          echo $GCP_SERVICE_ACCOUNT_KEY
-          echo $TERRAFORM_STATEFILE_BUCKET
-
           echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
           gcloud auth activate-service-account --key-file=gcloud.key
-
           files=$(gsutil ls "gs://${TERRAFORM_STATEFILE_BUCKET}")
-
           if [ $(echo $files | grep -c terraform.tfstate) == 0 ]; then
             echo "{\"version\": 3}" > terraform.tfstate
             gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET}
@@ -94,13 +95,18 @@ jobs:
             exit 0
           fi
 
+
+
 - name: pave-gcp
   build_logs_to_retain: 5
   serial_groups: [terraform]
   ensure:
     put: terraform-state
     params:
-      file: tfstate-output/*.tfstate
+      file:  tfstate-output/terraform.tfstate
+    put: keyval
+    params:
+      file: keyvalout/keyval.properties
   plan:
   - aggregate:
     - get: template
@@ -129,16 +135,30 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+
+          ls -al
+          ls -al template
+          
+          
+          cat terraform.tfvars
+
           terraform init \
                     template
+
           terraform plan \
-                    -var-file terraform.tfvars \
+                    -out=terraform.tfplan \
+                    -state=terraform-state/terraform.tfstate \
+                    template
+          terraform plan \
                     -out terraform.tfplan \
                     -state terraform-state/terraform.tfstate \
                     template
           terraform apply \
                     -state-out tfstate-output/terraform.tfstate \
                     terraform.tfplan
+          template/ci/scripts/auto_pass_keys.sh
+          PASSED_opsman_ip=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+
 
 - name: config-authentication
   build_logs_to_retain: 5
@@ -167,7 +187,8 @@ jobs:
         args: 
         - -c
         - |
-          set -eu          
+          set -eu 
+          cat           
           OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
           echo "OSPMAN: https://$OPSMAN_DOMAIN_OR_IP_ADDRESS"
           until $(curl --output /dev/null -k --silent --head --fail https://$OPSMAN_DOMAIN_OR_IP_ADDRESS/setup); do
@@ -827,8 +848,8 @@ jobs:
   - aggregate:
     - get: template
     - get: terraform-state
-      passed:
-      - pave-gcp
+     # passed:
+      #- pave-gcp
   - task: delete-installation
     params:
       OPS_MGR_USR: ((ops_mgr_usr))

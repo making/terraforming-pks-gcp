@@ -16,5 +16,5 @@ envsubst < params.yml.template > params.yml
 fly -t pks login -c http://127.0.0.1:8080 -u concourse -p password
 fly -t pks sync
 fly -t pks set-pipeline -p deploy-pks -c pipeline.yml -l params.yml -n
-#fly -t pks unpause-pipeline -p deploy-pks
-#fly -t pks trigger-job -j deploy-pks/bootstrap-terraform-state
+fly -t pks unpause-pipeline -p deploy-pks
+fly -t pks trigger-job -j deploy-pks/bootstrap-terraform-state
