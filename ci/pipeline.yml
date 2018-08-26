@@ -9,12 +9,19 @@ resource_types:
   source:
     repository: pivotalcf/pivnet-resource
     tag: latest-final
+- name: keyval
+  type: docker-image
+  source:
+    repository: swce/keyval-resource
+
 
 resources:
 - name: template
   type: git
   source:
-    uri: https://github.com/making/terraforming-pks-gcp
+    uri: https://github.com/dbbaskette/terraforming-pks-gcp
+    branch: master
+    skip_ssl_verification: true
 - name: terraform-state
   type: gcs
   source:
@@ -26,13 +33,15 @@ resources:
   source:
     api_token: ((pivnet_api_token))
     product_slug: pivotal-container-service
-    product_version: 1\.0\..*
+    product_version: 1\.1\..*
 - name: stemcell
   type: pivnet
   source:
     api_token: ((pivnet_api_token))
     product_slug: stemcells
     product_version: 3468\..*
+- name: keyval
+  type: keyval
 
 groups:
 - name: pks
@@ -55,7 +64,6 @@ groups:
 
 jobs:
 - name: bootstrap-terraform-state
-  build_logs_to_retain: 5
   serial: true
   plan:
   - task: create-terraform-state
@@ -68,7 +76,6 @@ jobs:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       run:
         path: bash
         args: 
@@ -76,12 +83,9 @@ jobs:
         - |
           # https://github.com/pivotal-cf/pcf-pipelines/blob/master/install-pcf/gcp/tasks/create-initial-terraform-state/task.sh
           set -eu
-
           echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
           gcloud auth activate-service-account --key-file=gcloud.key
-
           files=$(gsutil ls "gs://${TERRAFORM_STATEFILE_BUCKET}")
-
           if [ $(echo $files | grep -c terraform.tfstate) == 0 ]; then
             echo "{\"version\": 3}" > terraform.tfstate
             gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET}
@@ -91,17 +95,20 @@ jobs:
             exit 0
           fi
 
+
+
 - name: pave-gcp
   build_logs_to_retain: 5
   serial_groups: [terraform]
   ensure:
     put: terraform-state
     params:
-      file: tfstate-output/*.tfstate
+      file:  tfstate-output/terraform.tfstate
   plan:
   - aggregate:
     - get: template
     - get: terraform-state
+
   - task: terraform-apply
     params:
       TFVARS: ((tfvars))
@@ -109,14 +116,18 @@ jobs:
       platform: linux
       image_resource:
         type: docker-image
+        #source:
+        #  repository: hashicorp/terraform
+        #  tag: light
+        type: docker-image
         source:
-          repository: hashicorp/terraform
-          tag: light
+          repository: pcfnorm/rootfs
       inputs:
       - name: template
       - name: terraform-state
       outputs:
       - name: tfstate-output
+      - name: keyvalout
       run:
         path: sh
         args: 
@@ -126,16 +137,26 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+          ls -al template/ci/
           terraform init \
                     template
+          
           terraform plan \
-                    -var-file terraform.tfvars \
                     -out terraform.tfplan \
                     -state terraform-state/terraform.tfstate \
+                    -refresh=true \
                     template
           terraform apply \
                     -state-out tfstate-output/terraform.tfstate \
                     terraform.tfplan
+          
+
+          export PASSED_opsman_ip=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+          template/ci/scripts/auto_pass_keys.sh
+
+  - put: keyval
+    params:
+      file: keyvalout/keyval.properties
 
 - name: config-authentication
   build_logs_to_retain: 5
@@ -164,7 +185,8 @@ jobs:
         args: 
         - -c
         - |
-          set -eu          
+          set -eu 
+          cat           
           OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
           echo "OSPMAN: https://$OPSMAN_DOMAIN_OR_IP_ADDRESS"
           until $(curl --output /dev/null -k --silent --head --fail https://$OPSMAN_DOMAIN_OR_IP_ADDRESS/setup); do
@@ -339,7 +361,7 @@ jobs:
     - get: pks
       params:
         globs: 
-        - "pks-linux-*"
+        - "pivotal-container-service*"
   - task: copy-om
     config:
       platform: linux
@@ -390,6 +412,7 @@ jobs:
           AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
           FILENAME=`basename ${AWS_OBJECT_KEY}`
           DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/${PRODUCT_ID}/download"
+          # HARDCODE DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/190794/download"
 
           cat <<EOF > service-account.json
           ${GCP_SERVICE_ACCOUNT_KEY}
@@ -536,21 +559,17 @@ jobs:
           PKS_SERVICES_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network Name".value')
           SINGLETON_AVAILABILITY_ZONE=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | .[0]')
           AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | map({name: .})' | tr -d '\n' | tr -d '"')
+          AVAILABILITY_ZONE_NAMES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n' | tr -d '"')
           CERTIFICATES=$(om_generate_cert "*.sslip.io *.x.sslip.io")
           CERT_PEM=`echo $CERTIFICATES | jq -r '.certificate' | sed 's/^/        /'`
           KEY_PEM=`echo $CERTIFICATES | jq -r '.key' | sed 's/^/        /'`
           GCP_MASTER_SERVICE_ACCOUNT_KEY=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_master_node_service_account_key.value' | sed 's/^/      /')
           GCP_WORKER_SERVICE_ACCOUNT_KEY=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_worker_node_service_account_key.value' | sed 's/^/      /')
+          API_HOSTNAME=api-${PKS_DOMAIN}
           UAA_URL=api-${PKS_DOMAIN}
           LB_NAME="tcp:${GCP_RESOURCE_PREFIX}-pks-api"
-
-          om --target "https://${OPSMAN_DOMAIN_OR_IP_ADDRESS}" \
-             --username "$OPS_MGR_USR" \
-             --password "$OPS_MGR_PWD" \
-             --skip-ssl-validation \
-             configure-product \
-             --product-name "${PRODUCT_NAME}" \
-             --config <(cat <<EOF
+          
+          cat <<EOF > config.yml
           ---
           product-properties:
             .pivotal-container-service.pks_tls:
@@ -559,27 +578,33 @@ jobs:
           $CERT_PEM
                 private_key_pem: |
           $KEY_PEM
+            .properties.pks_api_hostname:
+              value: $API_HOSTNAME
             .properties.plan1_selector:
               value: Plan Active
-            .properties.plan1_selector.active.az_placement:
-              value: $SINGLETON_AVAILABILITY_ZONE
+            .properties.plan1_selector.active.master_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
             .properties.plan1_selector.active.master_vm_type:
               value: micro
+            .properties.plan1_selector.active.worker_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
             .properties.plan1_selector.active.worker_vm_type:
               value: medium
-            .properties.plan1_selector.active.persistent_disk_type:
+            .properties.plan1_selector.active.worker_persistent_disk_type:
               value: "51200"
             .properties.plan1_selector.active.worker_instances:
               value: 1
             .properties.plan2_selector:
               value: Plan Active
-            .properties.plan2_selector.active.az_placement:
-              value: $SINGLETON_AVAILABILITY_ZONE
+            .properties.plan2_selector.active.master_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
             .properties.plan2_selector.active.master_vm_type:
               value: small
+            .properties.plan2_selector.active.worker_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
             .properties.plan2_selector.active.worker_vm_type:
               value: large
-            .properties.plan2_selector.active.persistent_disk_type:
+            .properties.plan2_selector.active.worker_persistent_disk_type:
               value: "102400"
             .properties.plan2_selector.active.worker_instances:
               value: 3
@@ -597,8 +622,9 @@ jobs:
             .properties.cloud_provider.gcp.worker_service_account_key:
               value: |
           $GCP_WORKER_SERVICE_ACCOUNT_KEY
-            .properties.uaa_url:
-              value: $UAA_URL
+            .properties.telemetry_selector:
+              value: disabled        
+
           network-properties:
             network:
               name: $PKS_MAIN_NETWORK_NAME
@@ -614,7 +640,17 @@ jobs:
               elb_names:
               - $LB_NAME
               internet_connected: $INTERNET_CONNECTED
-          EOF)
+          EOF
+
+          cat config.yml
+
+          om --target "https://${OPSMAN_DOMAIN_OR_IP_ADDRESS}" \
+             --username "$OPS_MGR_USR" \
+             --password "$OPS_MGR_PWD" \
+             --skip-ssl-validation \
+             configure-product \
+             --product-name "${PRODUCT_NAME}" \
+             --config config.yml
 
           echo "PKS API: https://api-${PKS_DOMAIN}:9021"
           echo "UAA: https://api-${PKS_DOMAIN}:8443"
@@ -740,7 +776,7 @@ jobs:
                 --skip-ssl-validation \
                 curl \
                 --silent \
-                --path "/api/v0/deployed/products/${GUID}/credentials/.properties.uaa_admin_secret" \
+                --path "/api/v0/deployed/products/${GUID}/credentials/.properties.pks_uaa_management_admin_client" \
                 -x GET \
                 | jq -r '.credential.value.secret'
           )
@@ -810,38 +846,38 @@ jobs:
   - aggregate:
     - get: template
     - get: terraform-state
-      passed:
-      - pave-gcp
-  - task: delete-installation
-    params:
-      OPS_MGR_USR: ((ops_mgr_usr))
-      OPS_MGR_PWD: ((ops_mgr_pwd))
-    config:
-      platform: linux
-      image_resource:
-        type: docker-image
-        source:
-          repository: pcfnorm/rootfs
-          tag: 1.0.14
-      inputs:
-      - name: terraform-state
-      run:
-        path: bash
-        args: 
-        - -c
-        - |
-          set +e  
+     # passed:
+      #- pave-gcp
+  # - task: delete-installation
+  #   params:
+  #     OPS_MGR_USR: ((ops_mgr_usr))
+  #     OPS_MGR_PWD: ((ops_mgr_pwd))
+  #   config:
+  #     platform: linux
+  #     image_resource:
+  #       type: docker-image
+  #       source:
+  #         repository: pcfnorm/rootfs
+  #         tag: 1.0.14
+  #     inputs:
+  #     - name: terraform-state
+  #     run:
+  #       path: bash
+  #       args: 
+  #       - -c
+  #       - |
+  #         set +e  
 
-          OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
-          om-linux \
-            --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
-            --skip-ssl-validation \
-            --username "$OPS_MGR_USR" \
-            --password "$OPS_MGR_PWD" \
-            --request-timeout 900 \
-            delete-installation
+  #         OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+  #         om-linux \
+  #           --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
+  #           --skip-ssl-validation \
+  #           --username "$OPS_MGR_USR" \
+  #           --password "$OPS_MGR_PWD" \
+  #           --request-timeout 900 \
+  #           delete-installation
 
-  - task: terraform-destory
+  - task: terraform-destroy
     params:
       TFVARS: ((tfvars))
     config:
@@ -851,6 +887,7 @@ jobs:
         source:
           repository: hashicorp/terraform
           tag: light
+        
       inputs:
       - name: template
       - name: terraform-state
@@ -866,6 +903,8 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+
+          cat terraform-state/terraform.tfstate
           terraform init \
                     template
           terraform destroy \

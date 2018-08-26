@@ -68,3 +68,7 @@ gcloud compute forwarding-rules create ${CLUSTER_NAME}-master-api-8443 \
 pks get-credentials ${CLUSTER_NAME}
 kubectl cluster-info
 ```
+
+
+brew install gettext
+alias envsubst='/usr/local/Cellar/gettext/0.19.8.1//bin/envsubst'

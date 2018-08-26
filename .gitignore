@@ -7,5 +7,12 @@ plan
 credentials.yml
 .history/*
 .vscode*
+<<<<<<< HEAD
 params.yml
 variables.txt
+=======
+.gitig*
+params.yml
+
+ci/variables.txt
+>>>>>>> origin/master
