@@ -116,15 +116,18 @@ jobs:
       platform: linux
       image_resource:
         type: docker-image
+        #source:
+        #  repository: hashicorp/terraform
+        #  tag: light
+        type: docker-image
         source:
-          repository: hashicorp/terraform
-          tag: light
+          repository: pcfnorm/rootfs
       inputs:
       - name: template
       - name: terraform-state
       outputs:
       - name: tfstate-output
-      - name: keyval
+      - name: keyvalout
       run:
         path: sh
         args: 
@@ -134,27 +137,20 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
-
-          ls -al
-          ls -al template
-          
-          
-          cat terraform.tfvars
-
+          ls -al template/ci/
           terraform init \
                     template
-
-          terraform plan \
-                    -out=terraform.tfplan \
-                    -state=terraform-state/terraform.tfstate \
-                    template
+          
           terraform plan \
                     -out terraform.tfplan \
                     -state terraform-state/terraform.tfstate \
+                    -refresh=true \
                     template
           terraform apply \
                     -state-out tfstate-output/terraform.tfstate \
                     terraform.tfplan
+          
+
           export PASSED_opsman_ip=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
           template/ci/scripts/auto_pass_keys.sh
 
@@ -852,36 +848,36 @@ jobs:
     - get: terraform-state
      # passed:
       #- pave-gcp
-  - task: delete-installation
-    params:
-      OPS_MGR_USR: ((ops_mgr_usr))
-      OPS_MGR_PWD: ((ops_mgr_pwd))
-    config:
-      platform: linux
-      image_resource:
-        type: docker-image
-        source:
-          repository: pcfnorm/rootfs
-          tag: 1.0.14
-      inputs:
-      - name: terraform-state
-      run:
-        path: bash
-        args: 
-        - -c
-        - |
-          set +e  
+  # - task: delete-installation
+  #   params:
+  #     OPS_MGR_USR: ((ops_mgr_usr))
+  #     OPS_MGR_PWD: ((ops_mgr_pwd))
+  #   config:
+  #     platform: linux
+  #     image_resource:
+  #       type: docker-image
+  #       source:
+  #         repository: pcfnorm/rootfs
+  #         tag: 1.0.14
+  #     inputs:
+  #     - name: terraform-state
+  #     run:
+  #       path: bash
+  #       args: 
+  #       - -c
+  #       - |
+  #         set +e  
 
-          OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
-          om-linux \
-            --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
-            --skip-ssl-validation \
-            --username "$OPS_MGR_USR" \
-            --password "$OPS_MGR_PWD" \
-            --request-timeout 900 \
-            delete-installation
+  #         OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+  #         om-linux \
+  #           --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
+  #           --skip-ssl-validation \
+  #           --username "$OPS_MGR_USR" \
+  #           --password "$OPS_MGR_PWD" \
+  #           --request-timeout 900 \
+  #           delete-installation
 
-  - task: terraform-destory
+  - task: terraform-destroy
     params:
       TFVARS: ((tfvars))
     config:
@@ -891,6 +887,7 @@ jobs:
         source:
           repository: hashicorp/terraform
           tag: light
+        
       inputs:
       - name: template
       - name: terraform-state
@@ -906,6 +903,8 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+
+          cat terraform-state/terraform.tfstate
           terraform init \
                     template
           terraform destroy \
