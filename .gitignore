@@ -5,3 +5,7 @@ terraform.key.json
 *.tfvars
 plan
 credentials.yml
+.history/*
+.vscode*
+params.yml
+variables.txt
