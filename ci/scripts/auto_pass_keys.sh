@@ -1,4 +1,3 @@
-
 #!/bin/bash
 root=$PWD
 propsDir="$root/keyvalout"
