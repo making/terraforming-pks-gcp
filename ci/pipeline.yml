@@ -73,6 +73,7 @@ jobs:
     params:
       TERRAFORM_STATEFILE_BUCKET: ((terraform_statefile_bucket))
       GCP_SERVICE_ACCOUNT_KEY: ((gcp_service_account_key))
+      GCP_PROJECT_ID:  ((gcp_project_id))
     config:
       platform: linux
       image_resource:
@@ -89,8 +90,8 @@ jobs:
           set -eu
           echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
           gcloud auth activate-service-account --key-file=gcloud.key
-          gsutil mb -l us gs://${TERRAFORM_STATEFILE_BUCKET}
-          gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET}
+          gsutil mb -l us gs://${TERRAFORM_STATEFILE_BUCKET} -p ${GCP_PROJECT_ID}
+          gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET} 
           files=$(gsutil ls "gs://${TERRAFORM_STATEFILE_BUCKET}")
           if [ $(echo $files | grep -c terraform.tfstate) == 0 ]; then
             echo "{\"version\": 3}" > terraform.tfstate
