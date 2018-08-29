@@ -114,8 +114,6 @@ jobs:
   - aggregate:
     - get: template
     - get: terraform-state
-      passed:
-        - bootstrap-terraform-state
       trigger: true
 
   - task: terraform-apply
