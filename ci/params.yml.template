@@ -2,7 +2,7 @@ pivnet_api_token: $PIVNET_API_TOKEN
 terraform_statefile_bucket: $TERRAFORM_BUCKET
 gcp_project_id: $GCP_PROJECT_ID
 pks_env_prefix: $PKS_ENV_PREFIX 
-pks_version=1.1.4
+pks_version: 1.1.4
 ops_mgr_usr: admin
 ops_mgr_pwd: p@ssword2018
 pks_cli_username: $PKS_CLI_USERNAME
