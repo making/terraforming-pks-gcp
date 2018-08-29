@@ -54,7 +54,7 @@ From the `./ci` subdirectory:
 
 The script will launch multiple containers and bring up a Concourse instance and the load and start the pipeline.   After a few seconds, the script will complete and show a URL to access the pipeline within Concourse.
 
-`http://127.0.0.1:8080/teams/main/pipelines/deploy-pks`
+[http://127.0.0.1:8080/teams/main/pipelines/deploy-pks]([http://127.0.0.1:8080/teams/main/pipelines/deploy-pks])
 
 Username:  concourse
 Password:  password
