@@ -10,3 +10,5 @@ credentials.yml
 params.yml
 variables.txt.dbb
 .gitig*
+
+ci/variables.txt.edit
