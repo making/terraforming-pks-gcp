@@ -8,8 +8,7 @@ alias envsubst='/usr/local/Cellar/gettext/*/bin/envsubst'
 # MAKE SERVICE ACCOUNT KEY 1 LINE FOR EASIER 
 export GCP_SERVICE_ACCOUNT_KEY=$(tr -d '\n' < $(echo $GCP_SERVICE_ACCOUNT_KEY_PATH))
 
-brew install gettext
-brew link --force gettext 
+
 envsubst < params.yml.template > params.yml
 
 
