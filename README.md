@@ -59,6 +59,8 @@ The script will launch multiple containers and bring up a Concourse instance and
 Username:  concourse
 Password:  password
 
+The Last Step of the Pipeline, SHOW-NEXT-INSTRUCTIONS, has a task that displays the procedures for creating a K8S cluster.   You should be able to cut and past from that screen.
+
 
 
 ### Tearing down environment
