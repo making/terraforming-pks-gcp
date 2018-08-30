@@ -59,6 +59,7 @@ groups:
   - wipe-env
   - show-next-instructions
   - create-pks-cli-user
+  - create-pks-cluster
 
 - name: nat
   jobs:
@@ -886,7 +887,7 @@ jobs:
     - get: terraform-state
       passed:
       - deploy-pks
-      trigger: true
+      trigger: false
   - task: configure-pks-cli-user
     params:
       OPS_MGR_USR: {{ops_mgr_usr}}
@@ -1026,6 +1027,114 @@ jobs:
                     -state-out tfstate-output/terraform.tfstate \
                     template 
 
+- name: create-pks-cluster
+  plan:
+  - aggregate:
+    - get: terraform-state
+      passed:
+      - create-pks-cli-user
+      trigger: true
+
+  - task: create-pks-cluster
+    params:
+      PKS_CLI_USERNAME: {{pks_cli_username}}
+      PKS_CLI_PASSWORD: {{pks_cli_password}}
+      GCP_SERVICE_ACCOUNT_KEY: ((gcp_service_account_key))
+      GCP_PROJECT_ID: ((gcp_project_id))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pivotalservices/pks-kubectl
+      inputs:
+      - name: terraform-state
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          set -eu
+          
+          # REALLY NEED A GOOGLE GCLOUD CLI RESOURCE, BUT THIS WILL DO FOR NOW
+          wget -q -O googlecloud.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-214.0.0-linux-x86_64.tar.gz
+          tar xf googlecloud.tar.gz
+          ./google-cloud-sdk/install.sh -q
+          source /tmp/build/*/google-cloud-sdk/path.bash.inc
+          echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
+          gcloud auth activate-service-account --key-file=gcloud.key
+          gcloud config set project $GCP_PROJECT_ID
+
+          PKS_API_IP=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.pks-api-ip".primary.attributes.address')
+          PKS_DOMAIN=$(echo $PKS_API_IP | tr '.' '-').sslip.io
+          GCP_NETWORK=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_network.pks-network".primary.id')
+          GCP_REGION=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_subnetwork.pks-subnet".primary.attributes.region')
+
+
+          PKS_API_URL="https://api.${PKS_DOMAIN}:9021"
+          CLUSTER_NAME="greenplum"
+          
+          echo "Logging in to PKS API at $PKS_DOMAIN"
+          pks login -k -a ${PKS_API_URL} -u ${PKS_CLI_USERNAME} -p ${PKS_CLI_PASSWORD} --skip-ssl-validation
+          ### Create an external load balancer for \${CLUSTER_NAME} cluster
+          gcloud compute addresses create ${CLUSTER_NAME}-master-api-ip --region ${GCP_REGION}
+          gcloud compute target-pools create ${CLUSTER_NAME}-master-api --region ${GCP_REGION}
+          ### Create a Cluster
+          MASTER_EXTERNAL_IP=$(gcloud compute addresses describe ${CLUSTER_NAME}-master-api-ip --region ${GCP_REGION} --format json | jq -r .address)
+          MASTER_EXTERNAL_HOSTNAME=$(echo $MASTER_EXTERNAL_IP | tr '.' '-').sslip.io
+
+          ### Monitor Cluster Creation and wait for completion
+          
+          echo "Creating PKS cluster $CLUSTER_NAME"
+          echo "Master available at $MASTER_EXTERNAL_IP or $MASTER_EXTERNAL_HOSTNAME"
+          pks create-cluster ${CLUSTER_NAME} -e ${MASTER_EXTERNAL_IP} -p large
+
+          in_progress_state="in progress"
+          succeeded_state="succeeded"
+          cluster_state="$in_progress_state"
+          while [[ "$cluster_state" == "$in_progress_state" ]]; do
+            cluster_state=$(pks cluster "$CLUSTER_NAME" --json | jq -rc '.last_action_state')
+            echo "${cluster_state}..."
+            sleep 10
+          done
+
+          last_action_description=$(pks cluster "$CLUSTER_NAME" --json | jq -rc '.last_action_description')
+
+          if [[ "$cluster_state" == "$succeeded_state" ]]; then
+            echo "Successfully created cluster [$CLUSTER_NAME], last_action_state=[$cluster_state], last_action_description=[$last_action_description]"
+            pks cluster "$CLUSTER_NAME"
+            echo "Next step: make sure that the external hostname configured for the cluster [$MASTER_EXTERNAL_HOSTNAME] is accessible from a DNS/network standpoint, so it can be managed with 'kubectl'"
+          else
+            echo "Error creating cluster [$CLUSTER_NAME], last_action_state=[$cluster_state], last_action_description=[$last_action_description]"
+            exit 1
+          fi
+
+
+          CLUSTER_UUID=$(pks clusters | grep ${CLUSTER_NAME} | awk '{print $3}')
+          MASTER_INSTANCE_NAMES=$(gcloud compute instances list --filter "tags:service-instance-${CLUSTER_UUID}-master" --format "csv[no-heading](selfLink)" | tr '\n' ',' | sed 's/.$//')
+          echo "Creating Load Balancer for ${CLUSTER_NAME}"
+          echo "  - Attaching Masters to Backend: $MASTER_INSTANCE_NAMES"
+          gcloud compute target-pools add-instances ${CLUSTER_NAME}-master-api --instances ${MASTER_INSTANCE_NAMES} 
+          echo "  - Making $MASTER_EXTERNAL_HOSTNAME [$MASTER_EXTERNAL_IP] available via Port 8443"
+          gcloud compute forwarding-rules create ${CLUSTER_NAME}-master-api-8443 --region ${GCP_REGION} --address ${CLUSTER_NAME}-master-api-ip --target-pool ${CLUSTER_NAME}-master-api --ports 8443
+           
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 - name: stop-nat
   build_logs_to_retain: 5
   serial_groups: [nat]
@@ -1102,3 +1211,4 @@ params:
           gcloud compute instances ${SUBCMD} ${NAMES[$((i - 1))]} --zone ${ZONES[$((i - 1))]}
         done
         gcloud compute instances list
+
