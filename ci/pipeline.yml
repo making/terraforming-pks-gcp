@@ -873,8 +873,8 @@ jobs:
           kubectl cluster-info
 
           ### To View Kubernetes Dashboard
-          kubecrl proxy
-          Browse to: http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/.
+          kubectl proxy
+          Browse to: http://127.0.0.1:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/.
 
 
 
@@ -1117,7 +1117,25 @@ jobs:
           gcloud compute target-pools add-instances ${CLUSTER_NAME}-master-api --instances ${MASTER_INSTANCE_NAMES} 
           echo "  - Making $MASTER_EXTERNAL_HOSTNAME [$MASTER_EXTERNAL_IP] available via Port 8443"
           gcloud compute forwarding-rules create ${CLUSTER_NAME}-master-api-8443 --region ${GCP_REGION} --address ${CLUSTER_NAME}-master-api-ip --target-pool ${CLUSTER_NAME}-master-api --ports 8443
-           
+          
+
+          ### Access your cluster
+          echo "Download and install the PKS CLI on you local host"
+          echo;echo;echo;echo "========================================================="
+          echo "LOGIN:  "
+          echo "      pks login -k -a ${PKS_API_URL} -u ${PKS_CLI_USERNAME} -p ${PKS_CLI_PASSWORD} --skip-ssl-validation"
+          echo "PULL CREDENTIALS FROM PKS MASTER: "
+          echo "      pks get-credentials ${CLUSTER_NAME}"
+          echo "TEST CREDENTIALS: "
+          echo "      kubectl cluster-info"
+
+          ### To View Kubernetes Dashboard
+          echo "USE K8S DASHBOARD: "
+          echo "      kubectl proxy"
+          echo "      Browse to: http://127.0.0.1:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/."
+
+
+
 
 
 
