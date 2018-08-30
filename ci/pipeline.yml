@@ -9,30 +9,40 @@ resource_types:
   source:
     repository: pivotalcf/pivnet-resource
     tag: latest-final
+- name: keyval
+  type: docker-image
+  source:
+    repository: swce/keyval-resource
+
 
 resources:
 - name: template
   type: git
   source:
-    uri: https://github.com/making/terraforming-pks-gcp
+    uri: https://github.com/dbbaskette/terraforming-pks-gcp
+    branch: master
+    skip_ssl_verification: true
+
 - name: terraform-state
   type: gcs
   source:
     bucket: ((terraform_statefile_bucket))
     json_key: ((gcp_service_account_key))
     versioned_file: terraform.tfstate
-- name: pks
-  type: pivnet
-  source:
-    api_token: ((pivnet_api_token))
-    product_slug: pivotal-container-service
-    product_version: 1\.1\..*
+# - name: pks
+#   type: pivnet
+#   source:
+#     api_token: ((pivnet_api_token))
+#     product_slug: pivotal-container-service
+#     product_version: 1\.1\..*
 - name: stemcell
   type: pivnet
   source:
     api_token: ((pivnet_api_token))
     product_slug: stemcells
     product_version: 3468\..*
+- name: keyval
+  type: keyval
 
 groups:
 - name: pks
@@ -48,6 +58,9 @@ groups:
   - deploy-pks
   - wipe-env
   - show-next-instructions
+  - create-pks-cli-user
+  - create-pks-cluster
+
 - name: nat
   jobs:
   - start-nat
@@ -55,33 +68,32 @@ groups:
 
 jobs:
 - name: bootstrap-terraform-state
-  build_logs_to_retain: 5
   serial: true
   plan:
   - task: create-terraform-state
     params:
       TERRAFORM_STATEFILE_BUCKET: ((terraform_statefile_bucket))
       GCP_SERVICE_ACCOUNT_KEY: ((gcp_service_account_key))
+      GCP_PROJECT_ID:  ((gcp_project_id))
     config:
       platform: linux
       image_resource:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       run:
         path: bash
         args: 
         - -c
         - |
+          
           # https://github.com/pivotal-cf/pcf-pipelines/blob/master/install-pcf/gcp/tasks/create-initial-terraform-state/task.sh
           set -eu
-
           echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
           gcloud auth activate-service-account --key-file=gcloud.key
-
+          gsutil mb -l us -p ${GCP_PROJECT_ID} gs://${TERRAFORM_STATEFILE_BUCKET}  || echo "Bucket Exists"
+          gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET} 
           files=$(gsutil ls "gs://${TERRAFORM_STATEFILE_BUCKET}")
-
           if [ $(echo $files | grep -c terraform.tfstate) == 0 ]; then
             echo "{\"version\": 3}" > terraform.tfstate
             gsutil versioning set on gs://${TERRAFORM_STATEFILE_BUCKET}
@@ -91,17 +103,21 @@ jobs:
             exit 0
           fi
 
+
+
 - name: pave-gcp
   build_logs_to_retain: 5
   serial_groups: [terraform]
   ensure:
     put: terraform-state
     params:
-      file: tfstate-output/*.tfstate
+      file:  tfstate-output/terraform.tfstate
   plan:
   - aggregate:
     - get: template
     - get: terraform-state
+      trigger: true
+
   - task: terraform-apply
     params:
       TFVARS: ((tfvars))
@@ -109,14 +125,18 @@ jobs:
       platform: linux
       image_resource:
         type: docker-image
+        #source:
+        #  repository: hashicorp/terraform
+        #  tag: light
+        type: docker-image
         source:
-          repository: hashicorp/terraform
-          tag: light
+          repository: pcfnorm/rootfs
       inputs:
       - name: template
       - name: terraform-state
       outputs:
       - name: tfstate-output
+      - name: keyvalout
       run:
         path: sh
         args: 
@@ -126,16 +146,26 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+          ls -al template/ci/
           terraform init \
                     template
+          
           terraform plan \
-                    -var-file terraform.tfvars \
                     -out terraform.tfplan \
                     -state terraform-state/terraform.tfstate \
+                    -refresh=true \
                     template
           terraform apply \
                     -state-out tfstate-output/terraform.tfstate \
                     terraform.tfplan
+          
+          echo $(cat tfstate-output/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+          export PASSED_opsman_ip=$(cat tfstate-output/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+          template/ci/scripts/auto_pass_keys.sh
+
+  - put: keyval
+    params:
+      file: keyvalout/keyval.properties
 
 - name: config-authentication
   build_logs_to_retain: 5
@@ -145,6 +175,7 @@ jobs:
       passed:
       - pave-gcp
       trigger: true
+    - get: keyval
   - task: config-director
     params:
       OPS_MGR_USR: ((ops_mgr_usr))
@@ -156,16 +187,32 @@ jobs:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       inputs:
       - name: terraform-state
+      - name: keyval
       run:
         path: bash
         args: 
         - -c
         - |
-          set -eu          
-          OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+          set -eu 
+          root=$PWD
+          props="$root/keyval/keyval.properties"
+          if [ -f "$props" ]
+          then
+            echo "Reading passed key values"
+            while IFS= read -r var
+            do
+              if [ ! -z "$var" ]
+              then
+                echo "Adding: $var"
+                export "$var"
+              fi
+            done < "$props"
+          fi
+          export OPSMAN_DOMAIN_OR_IP_ADDRESS=$PASSED_opsman_ip
+          
+          #OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
           echo "OSPMAN: https://$OPSMAN_DOMAIN_OR_IP_ADDRESS"
           until $(curl --output /dev/null -k --silent --head --fail https://$OPSMAN_DOMAIN_OR_IP_ADDRESS/setup); do
               printf '.'
@@ -202,115 +249,114 @@ jobs:
         source:
           repository: pcfnorm/rootfs
           tag: 1.0.14
+
       inputs:
       - name: terraform-state
       run:
         path: bash
         args: 
-        - -c
-        - |
-          set -eu
-          cp /usr/local/bin/om-linux /usr/local/bin/om
-          cp terraform-state/terraform.tfstate ./
-
-          INTERNET_CONNECTED=true
-          AUTH_JSON=$(cat terraform.tfstate | jq -r .modules[0].outputs.AuthJSON.value)
-          OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
-          GCP_PROJECT_ID=$(echo $AUTH_JSON | jq -r .project_id)
-          GCP_RESOURCE_PREFIX=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Default Deployment Tag".value')
-          GCP_SERVICE_ACCOUNT_KEY=$(echo ${AUTH_JSON})
-          AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | map({name: .})' | tr -d '\n' | tr -d '"')
-          PKS_INFRASTRUCTURE_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Name".value')
-          PKS_INFRASTRUCTURE_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Google Network Name ".value')
-          PKS_INFRASTRUCTURE_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network CIDR".value')
-          PKS_INFRASTRUCTURE_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Reserved IP Ranges".value')
-          PKS_INFRASTRUCTURE_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network DNS".value')
-          PKS_INFRASTRUCTURE_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Gateway".value')
-          PKS_INFRASTRUCTURE_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
-          PKS_MAIN_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Name".value')
-          PKS_MAIN_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Google Network Name ".value')
-          PKS_MAIN_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network CIDR".value')
-          PKS_MAIN_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Reserved IP Ranges".value')
-          PKS_MAIN_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network DNS".value')
-          PKS_MAIN_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Gateway".value')
-          PKS_MAIN_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
-          PKS_SERVICES_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network Name".value')
-          PKS_SERVICES_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network Google Network Name ".value')
-          PKS_SERVICES_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network CIDR".value')
-          PKS_SERVICES_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network Reserved IP Ranges".value')
-          PKS_SERVICES_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network DNS".value')
-          PKS_SERVICES_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network Gateway".value')
-          PKS_SERVICES_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
-          SINGLETON_AVAILABILITY_NETWORK=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Name".value')
-          SINGLETON_AVAILABILITY_ZONE=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | .[0]')
-
-          om --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
-             --skip-ssl-validation \
-             --username "$OPS_MGR_USR" \
-             --password "$OPS_MGR_PWD" \
-             configure-director \
-             --config <(cat <<EOF
-          ---
-          iaas-configuration:
-            project: $GCP_PROJECT_ID
-            default_deployment_tag: $GCP_RESOURCE_PREFIX
-            auth_json: |
-              $GCP_SERVICE_ACCOUNT_KEY
-          director-configuration:
-            ntp_servers_string: metadata.google.internal
-            resurrector_enabled: true
-            post_deploy_enabled: true
-            database_type: internal
-            blobstore_type: local
-          az-configuration: $AVAILABILITY_ZONES
-          networks-configuration:
-            icmp_checks_enabled: false
-            networks:
-            - name: $PKS_INFRASTRUCTURE_NETWORK_NAME
-              service_network: false
-              subnets:
-              - iaas_identifier: $PKS_INFRASTRUCTURE_IAAS_IDENTIFIER
-                cidr: $PKS_INFRASTRUCTURE_NETWORK_CIDR
-                reserved_ip_ranges: $PKS_INFRASTRUCTURE_RESERVED_IP_RANGES
-                dns: $PKS_INFRASTRUCTURE_DNS
-                gateway: $PKS_INFRASTRUCTURE_GATEWAY
-                availability_zone_names: $PKS_INFRASTRUCTURE_AVAILABILITY_ZONES
-            - name: $PKS_MAIN_NETWORK_NAME
-              service_network: false
-              subnets:
-              - iaas_identifier: $PKS_MAIN_IAAS_IDENTIFIER
-                cidr: $PKS_MAIN_NETWORK_CIDR
-                reserved_ip_ranges: $PKS_MAIN_RESERVED_IP_RANGES
-                dns: $PKS_MAIN_DNS
-                gateway: $PKS_MAIN_GATEWAY
-                availability_zone_names: $PKS_MAIN_AVAILABILITY_ZONES
-            - name: $PKS_SERVICES_NETWORK_NAME
-              service_network: true
-              subnets:
-              - iaas_identifier: $PKS_SERVICES_IAAS_IDENTIFIER
-                cidr: $PKS_SERVICES_NETWORK_CIDR
-                reserved_ip_ranges: $PKS_SERVICES_RESERVED_IP_RANGES
-                dns: $PKS_SERVICES_DNS
-                gateway: $PKS_SERVICES_GATEWAY
-                availability_zone_names: $PKS_SERVICES_AVAILABILITY_ZONES
-          network-assignment:
-            network:
-              name: $SINGLETON_AVAILABILITY_NETWORK
-            singleton_availability_zone:
-              name: $SINGLETON_AVAILABILITY_ZONE
-          security-configuration:
-            trusted_certificates: "$OPS_MGR_TRUSTED_CERTS"
-            vm_password_type: generate
-          resource-configuration:
-            director:
-              instance_type:
-                id: $DIRECTOR_VM_TYPE
-              internet_connected: $INTERNET_CONNECTED
-            compilation:
-              instance_type:
-                id: large.cpu
-              internet_connected: $INTERNET_CONNECTED
-          EOF)
+          - -c
+          - |
+            set -eu
+            cp /usr/local/bin/om-linux /usr/local/bin/om
+            cp terraform-state/terraform.tfstate ./
+            INTERNET_CONNECTED=true
+            AUTH_JSON=$(cat terraform.tfstate | jq -r .modules[0].outputs.AuthJSON.value)
+            OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+            GCP_PROJECT_ID=$(echo $AUTH_JSON | jq -r .project_id)
+            GCP_RESOURCE_PREFIX=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Default Deployment Tag".value')
+            GCP_SERVICE_ACCOUNT_KEY=$(echo ${AUTH_JSON})
+            AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | map({name: .})' | tr -d '\n' | tr -d '"')
+            PKS_INFRASTRUCTURE_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Name".value')
+            PKS_INFRASTRUCTURE_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Google Network Name ".value')
+            PKS_INFRASTRUCTURE_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network CIDR".value')
+            PKS_INFRASTRUCTURE_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Reserved IP Ranges".value')
+            PKS_INFRASTRUCTURE_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network DNS".value')
+            PKS_INFRASTRUCTURE_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Gateway".value')
+            PKS_INFRASTRUCTURE_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
+            PKS_MAIN_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Name".value')
+            PKS_MAIN_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Google Network Name ".value')
+            PKS_MAIN_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network CIDR".value')
+            PKS_MAIN_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Reserved IP Ranges".value')
+            PKS_MAIN_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network DNS".value')
+            PKS_MAIN_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Main Network Gateway".value')
+            PKS_MAIN_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
+            PKS_SERVICES_NETWORK_NAME=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network Name".value')
+            PKS_SERVICES_IAAS_IDENTIFIER=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network Google Network Name ".value')
+            PKS_SERVICES_NETWORK_CIDR=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Service Network CIDR".value')
+            PKS_SERVICES_RESERVED_IP_RANGES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network Reserved IP Ranges".value')
+            PKS_SERVICES_DNS=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network DNS".value')
+            PKS_SERVICES_GATEWAY=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Services Network Gateway".value')
+            PKS_SERVICES_AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n')
+            SINGLETON_AVAILABILITY_NETWORK=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Infrastructure Network Name".value')
+            SINGLETON_AVAILABILITY_ZONE=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | .[0]')
+            om --target https://$OPSMAN_DOMAIN_OR_IP_ADDRESS \
+              --skip-ssl-validation \
+              --username "$OPS_MGR_USR" \
+              --password "$OPS_MGR_PWD" \
+              configure-director \
+              --config <(cat <<EOF
+            ---
+            iaas-configuration:
+              project: $GCP_PROJECT_ID
+              default_deployment_tag: $GCP_RESOURCE_PREFIX
+              auth_json: |
+                $GCP_SERVICE_ACCOUNT_KEY
+            director-configuration:
+              ntp_servers_string: metadata.google.internal
+              resurrector_enabled: true
+              post_deploy_enabled: true
+              database_type: internal
+              blobstore_type: local
+            az-configuration: $AVAILABILITY_ZONES
+            networks-configuration:
+              icmp_checks_enabled: false
+              networks:
+              - name: $PKS_INFRASTRUCTURE_NETWORK_NAME
+                service_network: false
+                subnets:
+                - iaas_identifier: $PKS_INFRASTRUCTURE_IAAS_IDENTIFIER
+                  cidr: $PKS_INFRASTRUCTURE_NETWORK_CIDR
+                  reserved_ip_ranges: $PKS_INFRASTRUCTURE_RESERVED_IP_RANGES
+                  dns: $PKS_INFRASTRUCTURE_DNS
+                  gateway: $PKS_INFRASTRUCTURE_GATEWAY
+                  availability_zone_names: $PKS_INFRASTRUCTURE_AVAILABILITY_ZONES
+              - name: $PKS_MAIN_NETWORK_NAME
+                service_network: false
+                subnets:
+                - iaas_identifier: $PKS_MAIN_IAAS_IDENTIFIER
+                  cidr: $PKS_MAIN_NETWORK_CIDR
+                  reserved_ip_ranges: $PKS_MAIN_RESERVED_IP_RANGES
+                  dns: $PKS_MAIN_DNS
+                  gateway: $PKS_MAIN_GATEWAY
+                  availability_zone_names: $PKS_MAIN_AVAILABILITY_ZONES
+              - name: $PKS_SERVICES_NETWORK_NAME
+                service_network: true
+                subnets:
+                - iaas_identifier: $PKS_SERVICES_IAAS_IDENTIFIER
+                  cidr: $PKS_SERVICES_NETWORK_CIDR
+                  reserved_ip_ranges: $PKS_SERVICES_RESERVED_IP_RANGES
+                  dns: $PKS_SERVICES_DNS
+                  gateway: $PKS_SERVICES_GATEWAY
+                  availability_zone_names: $PKS_SERVICES_AVAILABILITY_ZONES
+            network-assignment:
+              network:
+                name: $SINGLETON_AVAILABILITY_NETWORK
+              singleton_availability_zone:
+                name: $SINGLETON_AVAILABILITY_ZONE
+            security-configuration:
+              trusted_certificates: "$OPS_MGR_TRUSTED_CERTS"
+              vm_password_type: generate
+            resource-configuration:
+              director:
+                instance_type:
+                  id: $DIRECTOR_VM_TYPE
+                internet_connected: $INTERNET_CONNECTED
+              compilation:
+                instance_type:
+                  id: large.cpu
+                internet_connected: $INTERNET_CONNECTED
+            EOF)
 
 - name: deploy-director
   build_logs_to_retain: 5
@@ -319,7 +365,7 @@ jobs:
     - get: terraform-state
       passed:
       - config-director
-      # trigger: true
+      trigger: true
   - task: apply-changes
     params:
       OPS_MGR_USR: ((ops_mgr_usr))
@@ -333,13 +379,9 @@ jobs:
   - aggregate:
     - get: terraform-state
       passed:
-      # - deploy-director
-      - config-director
+      - deploy-director
+      #- config-director
       trigger: true
-    - get: pks
-      params:
-        globs: 
-        - "pks-linux-*"
   - task: copy-om
     config:
       platform: linux
@@ -347,7 +389,6 @@ jobs:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       outputs:
       - name: om
       run:
@@ -365,16 +406,16 @@ jobs:
       PIVNET_API_TOKEN: ((pivnet_api_token))
       OPS_MGR_USR: ((ops_mgr_usr))
       OPS_MGR_PWD: ((ops_mgr_pwd))
+      RELEASE_VERSION: ((pks_version))
     config:
       platform: linux
       image_resource:
         type: docker-image
         source:
-          repository: google/cloud-sdk
-          tag: alpine
+          repository: pcfnorm/rootfs
       inputs:
       - name: om
-      - name: pks
+  
       caches:
       - path: cache/.ssh
       - path: cache/.config
@@ -385,16 +426,32 @@ jobs:
         - |
           set -e
 
-          RELEASE_ID=`cat pks/metadata.json | python -c 'import json,sys;print json.load(sys.stdin)["Release"]["ID"]'`
-          PRODUCT_ID=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["ID"]'`
-          AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
-          FILENAME=`basename ${AWS_OBJECT_KEY}`
-          DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/${PRODUCT_ID}/download"
+          
+          #RELEASE_ID=`cat pks/metadata.json | python -c 'import json,sys;print json.load(sys.stdin)["Release"]["Version"]'`
+          #PRODUCT_ID=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["ID"]'`
+          #AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
+          #FILENAME=`basename ${AWS_OBJECT_KEY}`
+          #DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/${PRODUCT_ID}/download"
+          # HARDCODE DOWNLOAD_URL="https://network.pivotal.io/api/v2/products/pivotal-container-service/releases/${RELEASE_ID}/product_files/190794/download"
 
+          install_pivnet_cli_cmd="wget -q -O pivnet https://github.com/pivotal-cf/pivnet-cli/releases/download/v0.0.53/pivnet-linux-amd64-0.0.53;chmod +x pivnet"
+          auth_cmd="./pivnet login --api-token $PIVNET_API_TOKEN"
+
+
+          eval $install_pivnet_cli_cmd
+          eval $auth_cmd
+
+          PRODUCT_ID=$(./pivnet product-files -p pivotal-container-service -r ${RELEASE_VERSION} --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '.id' -r)
+          DOWNLOAD_URL=$(./pivnet product-files -p pivotal-container-service -r 1.1.4 --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '._links.download.href' -r)
+          FILENAME=$(./pivnet product-files -p pivotal-container-service -r 1.1.4 --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '.name' -r)
+
+          echo $PRODUCT_ID
+          echo $DOWNLOAD_URL
+          echo $FILENAME
+  
           cat <<EOF > service-account.json
           ${GCP_SERVICE_ACCOUNT_KEY}
           EOF
-
           cp -r cache/.ssh /root/
           cp -r cache/.config /root/
 
@@ -412,6 +469,13 @@ jobs:
           cp -r /root/.ssh cache/
           cp -r /root/.config cache/
 
+          #jq_cmd="sudo apt-get update;sudo apt-get install jq"
+          #access_token=$(curl -s -X POST https://network.pivotal.io/api/v2/authentication/access_tokens -d "{\"refresh_token\":\"${PIVNET_API_TOKEN}\"}" | jq '.access_token' -r)
+          #wget_cmd="wget -O '${FILENAME}' --header='Authorization: Token ${access_token}' ${DOWNLOAD_URL}" 
+
+
+          download_cmd="./pivnet download-product-files -p pivotal-container-service -r ${RELEASE_VERSION} -i ${PRODUCT_ID} --accept-eula"
+
           set -e
           if [ "${LS}" = "${FILENAME}" ];then
             echo "${FILENAME} exists"
@@ -422,7 +486,7 @@ jobs:
                 --force-key-file-overwrite \
                 --strict-host-key-checking=no \
                 --quiet \
-                --command "wget -q -O "${FILENAME}" --header='Authorization: Token ${PIVNET_API_TOKEN}' ${DOWNLOAD_URL}" 
+                --command "$install_pivnet_cli_cmd;$auth_cmd;$download_cmd"
           fi
 
           set +e
@@ -443,12 +507,14 @@ jobs:
           fi
 
           # upload
+
+
           gcloud compute ssh ubuntu@${PKS_ENV_PREFIX}-ops-manager \
               --zone ${ZONE} \
               --force-key-file-overwrite \
               --strict-host-key-checking=no \
               --quiet \
-              --command "~/om-linux --target https://localhost -k -u ${OPS_MGR_USR} -p ${OPS_MGR_PWD} --request-timeout 3600 upload-product -p ~/${FILENAME}"   
+              --command "~/om-linux --target https://localhost -k -u ${OPS_MGR_USR} -p ${OPS_MGR_PWD} --request-timeout 3600 upload-product -p ${FILENAME}"   
 
           PRODUCT_NAME=`basename $FILENAME .pivotal | python -c 'print("-".join(raw_input().split("-")[:-2]))'`
           PRODUCT_VERSION=`basename $FILENAME .pivotal | python -c 'print("-".join(raw_input().split("-")[-2:]))'`
@@ -469,18 +535,13 @@ jobs:
       passed:
       - upload-pks
       trigger: true
-    - get: pks
-      passed:
-      - upload-pks
-      params:
-        globs: 
-        - "pks-linux-*"
-      trigger: true
   - task: config-pks
     params:
       OPS_MGR_USR: ((ops_mgr_usr))
       OPS_MGR_PWD: ((ops_mgr_pwd))
       INTERNET_CONNECTED: ((internet_connected))
+      PIVNET_API_TOKEN: ((pivnet_api_token))
+      RELEASE_VERSION: ((pks_version))
     config:
       platform: linux
       image_resource:
@@ -488,9 +549,9 @@ jobs:
         source:
           repository: pcfnorm/rootfs
           tag: 1.0.14
+
       inputs:
       - name: terraform-state
-      - name: pks
       run:
         path: bash
         args: 
@@ -500,13 +561,22 @@ jobs:
           cp /usr/local/bin/om-linux /usr/local/bin/om
           cp terraform-state/terraform.tfstate ./
           
+          install_pivnet_cli_cmd="wget -q -O pivnet https://github.com/pivotal-cf/pivnet-cli/releases/download/v0.0.53/pivnet-linux-amd64-0.0.53;chmod +x pivnet"
+          auth_cmd="./pivnet login --api-token $PIVNET_API_TOKEN"
+
+
+          eval $install_pivnet_cli_cmd
+          eval $auth_cmd
+
+          PRODUCT_ID=$(./pivnet product-files -p pivotal-container-service -r ${RELEASE_VERSION} --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '.id' -r)
+          DOWNLOAD_URL=$(./pivnet product-files -p pivotal-container-service -r 1.1.4 --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '._links.download.href' -r)
+          FILENAME=$(./pivnet product-files -p pivotal-container-service -r 1.1.4 --format=json | jq '.[] | select(.name | contains("pivotal-container-service"))' | jq '.name' -r)
+          PRODUCT_NAME="pivotal-container-service"
+      
+
           OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
-          RELEASE_ID=`cat pks/metadata.json | python -c 'import json,sys;print json.load(sys.stdin)["Release"]["ID"]'`
-          PRODUCT_ID=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["ID"]'`
-          AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
-          FILENAME=`basename ${AWS_OBJECT_KEY}`
-          PRODUCT_NAME=`basename $FILENAME .pivotal | python -c 'print("-".join(raw_input().split("-")[:-2]))'` # pivotal-container-service
-          PRODUCT_VERSION=`basename $FILENAME .pivotal | python -c 'print("-".join(raw_input().split("-")[-2:]))'` # 1.0.4-build.5
+          #AWS_OBJECT_KEY=`cat pks/metadata.json | python -c 'import json,sys;print filter(lambda x:x["AWSObjectKey"].endswith(".pivotal"),json.load(sys.stdin)["ProductFiles"])[0]["AWSObjectKey"]'`
+          
 
           om_generate_cert() (
             set -eu
@@ -537,15 +607,15 @@ jobs:
           SINGLETON_AVAILABILITY_ZONE=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | .[0]')
           AVAILABILITY_ZONES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value | map({name: .})' | tr -d '\n' | tr -d '"')
           AVAILABILITY_ZONE_NAMES=$(cat terraform.tfstate | jq -r '.modules[0].outputs."Availability Zones".value' | tr -d '\n' | tr -d '"')
-          CERTIFICATES=$(om_generate_cert "*.sslip.io *.x.sslip.io")
+          CERTIFICATES=$(om_generate_cert "*.sslip.io *.x.sslip.io $PKS_DOMAIN $PKS_API_IP")
           CERT_PEM=`echo $CERTIFICATES | jq -r '.certificate' | sed 's/^/        /'`
           KEY_PEM=`echo $CERTIFICATES | jq -r '.key' | sed 's/^/        /'`
-          GCP_MASTER_SERVICE_ACCOUNT_KEY=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_master_node_service_account_key.value' | sed 's/^/      /')
-          GCP_WORKER_SERVICE_ACCOUNT_KEY=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_worker_node_service_account_key.value' | sed 's/^/      /')
-          API_HOSTNAME=api-${PKS_DOMAIN}
-          UAA_URL=api-${PKS_DOMAIN}
+          GCP_MASTER_SERVICE_ACCOUNT_ID=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_master_node_service_account_key.value' | jq -r '.client_email')
+          GCP_WORKER_SERVICE_ACCOUNT_ID=$(cat terraform.tfstate | jq -r '.modules[0].outputs.pks_worker_node_service_account_key.value' | jq -r '.client_email')
+          API_HOSTNAME=api.${PKS_DOMAIN}
+          UAA_URL=api.${PKS_DOMAIN}
+         
           LB_NAME="tcp:${GCP_RESOURCE_PREFIX}-pks-api"
-          
           cat <<EOF > config.yml
           ---
           product-properties:
@@ -580,25 +650,37 @@ jobs:
             .properties.plan2_selector.active.worker_az_placement:
               value: $AVAILABILITY_ZONE_NAMES
             .properties.plan2_selector.active.worker_vm_type:
-              value: large
+              value: xlarge
             .properties.plan2_selector.active.worker_persistent_disk_type:
               value: "102400"
             .properties.plan2_selector.active.worker_instances:
-              value: 3
+              value: 6
             .properties.plan3_selector:
-              value: Plan Inactive
+              value: Plan Active
+            .properties.plan3_selector.active.master_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
+            .properties.plan3_selector.active.master_vm_type:
+              value: large
+            .properties.plan3_selector.active.worker_az_placement:
+              value: $AVAILABILITY_ZONE_NAMES
+            .properties.plan3_selector.active.master_instances:
+              value: 3
+            .properties.plan3_selector.active.worker_vm_type:
+              value: xlarge
+            .properties.plan3_selector.active.worker_persistent_disk_type:
+              value: "102400"
+            .properties.plan3_selector.active.worker_instances:
+              value: 9
             .properties.cloud_provider:
               value: GCP
             .properties.cloud_provider.gcp.project_id:
               value: $GCP_PROJECT_ID
             .properties.cloud_provider.gcp.network:
               value: $GCP_NETWORK
-            .properties.cloud_provider.gcp.master_service_account_key:
-              value: |
-          $GCP_MASTER_SERVICE_ACCOUNT_KEY
-            .properties.cloud_provider.gcp.worker_service_account_key:
-              value: |
-          $GCP_WORKER_SERVICE_ACCOUNT_KEY
+            .properties.cloud_provider.gcp.master_service_account:
+              value: $GCP_MASTER_SERVICE_ACCOUNT_ID
+            .properties.cloud_provider.gcp.worker_service_account:
+              value: $GCP_WORKER_SERVICE_ACCOUNT_ID
             .properties.telemetry_selector:
               value: disabled        
 
@@ -627,7 +709,7 @@ jobs:
              --skip-ssl-validation \
              configure-product \
              --product-name "${PRODUCT_NAME}" \
-             --config config.yml
+             --config ./config.yml
 
           echo "PKS API: https://api-${PKS_DOMAIN}:9021"
           echo "UAA: https://api-${PKS_DOMAIN}:8443"
@@ -655,7 +737,6 @@ jobs:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       inputs:
       - name: terraform-state
       - name: stemcell
@@ -685,13 +766,7 @@ jobs:
       - config-pks
       - upload-stemcell
       trigger: true
-    - get: pks
-      passed:
-      - config-pks
-      params:
-        globs: 
-        - "pks-linux-*"
-      trigger: true
+    
   - task: apply-changes
     params:
       OPS_MGR_USR: ((ops_mgr_usr))
@@ -705,20 +780,24 @@ jobs:
   - aggregate:
     - get: terraform-state
       passed:
-      - deploy-pks
+      - create-pks-cli-user
       trigger: true
+
+
+
   - task: show-next-instructions
     params:
       OPS_MGR_USR: ((ops_mgr_usr))
       OPS_MGR_PWD: ((ops_mgr_pwd))
       INTERNET_CONNECTED: ((internet_connected))
+      PKS_CLI_USERNAME: {{pks_cli_username}}
+      PKS_CLI_PASSWORD: {{pks_cli_password}}
     config:
       platform: linux
       image_resource:
         type: docker-image
         source:
           repository: pcfnorm/rootfs
-          tag: 1.0.14
       inputs:
       - name: terraform-state
       run:
@@ -758,59 +837,118 @@ jobs:
                 | jq -r '.credential.value.secret'
           )
 
-          PKS_API_URL=https://api-${PKS_DOMAIN}:9021
-          UAA_URL=https://api-${PKS_DOMAIN}:8443
-
+          PKS_API_URL="https://api.${PKS_DOMAIN}:9021"
+          UAA_URL="https://api.${PKS_DOMAIN}:8443"
+          CLUSTER_NAME="pks-demo1"
+          
           cat <<EOF
           
           PKS_API_URL=${PKS_API_URL}
           UAA_URL=${UAA_URL}
           ADMIN_SECRET=${ADMIN_SECRET}
-
-          PKS_USER=demo@example.com
-          PKS_PASSWORD=demodemo1234
-
+          PKS_CLI_USERNAME=${PKS_CLI_USERNAME}
+          PKS_CLI_PASSWORD=${PKS_CLI_PASSWORD}
           GCP_REGION=${GCP_REGION}
-          CLUSTER_NAME=pks-demo1
-
+          CLUSTER_NAME="pks-demo1"
           The following instruction shows how to create a cluster named "\${CLUSTER_NAME}"
-
-          ### Grant Cluster Access to a User          
-          uaac target \${UAA_URL} --skip-ssl-validation
-          uaac token client get admin -s \${ADMIN_SECRET}
-          uaac user add \${PKS_USER} --emails \${PKS_USER} -p \${PKS_PASSWORD}
-          uaac member add pks.clusters.admin \${PKS_USER}
-
+        
           ### Log in to PKS
-          pks login -k -a \${PKS_API_URL} -u \${PKS_USER} -p \${PKS_PASSWORD}
-
+          pks login -k -a ${PKS_API_URL} -u \${PKS_CLI_USERNAME} -p \${PKS_CLI_PASSWORD}
           ### Create an external load balancer for \${CLUSTER_NAME} cluster
           gcloud compute addresses create \${CLUSTER_NAME}-master-api-ip --region \${GCP_REGION}
           gcloud compute target-pools create \${CLUSTER_NAME}-master-api --region \${GCP_REGION}
-
           ### Create a Cluster
           MASTER_EXTERNAL_IP=\$(gcloud compute addresses describe \${CLUSTER_NAME}-master-api-ip --region \${GCP_REGION} --format json | jq -r .address)
-          pks create-cluster \${CLUSTER_NAME} -e \${MASTER_EXTERNAL_IP} -p small -n 1
-
+          pks create-cluster \${CLUSTER_NAME} -e \${MASTER_EXTERNAL_IP} -p large
+          ### Monitor Cluster Creation
+          watch -n 5 pks cluster \${CLUSTER_NAME}
           ### Configure your external load balancer to point to the master vm
           CLUSTER_UUID=\$(pks clusters | grep \${CLUSTER_NAME} | awk '{print \$3}')
-          MASTER_INSTANCE_NAME=\$(gcloud compute instances list --filter "tags:service-instance-\${CLUSTER_UUID}-master" | awk 'NR>1 {print \$1}')
-          MASTER_INSTANCE_ZONE=\$(gcloud compute instances list --filter "tags:service-instance-\${CLUSTER_UUID}-master" | awk 'NR>1 {print \$2}')
-          gcloud compute target-pools add-instances \${CLUSTER_NAME}-master-api \\
-                  --instances \${MASTER_INSTANCE_NAME} \\
-                  --instances-zone \${MASTER_INSTANCE_ZONE} \\
-                  --region \${GCP_REGION}
-          gcloud compute forwarding-rules create \${CLUSTER_NAME}-master-api-8443 \\
-                  --region \${GCP_REGION} \\
-                  --address \${CLUSTER_NAME}-master-api-ip \\
-                  --target-pool \${CLUSTER_NAME}-master-api  \\
-                  --ports 8443
-
+          MASTER_INSTANCE_NAMES=\$(gcloud compute instances list --filter "tags:service-instance-\${CLUSTER_UUID}-master" --format "csv[no-heading](selfLink)" | tr '\n' ',' | sed 's/.$//')
+          gcloud compute target-pools add-instances \${CLUSTER_NAME}-master-api --instances \${MASTER_INSTANCE_NAMES} 
+          gcloud compute forwarding-rules create \${CLUSTER_NAME}-master-api-8443 --region \${GCP_REGION} \\
+                  --address \${CLUSTER_NAME}-master-api-ip --target-pool \${CLUSTER_NAME}-master-api --ports 8443
           ### Access your cluster
           pks get-credentials \${CLUSTER_NAME}
           kubectl cluster-info
+
+          ### To View Kubernetes Dashboard
+          kubectl proxy
+          Browse to: http://127.0.0.1:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/.
+
+
+
           EOF
 
+
+- name: create-pks-cli-user
+  plan:
+  - aggregate:
+    - get: terraform-state
+      passed:
+      - deploy-pks
+      trigger: false
+  - task: configure-pks-cli-user
+    params:
+      OPS_MGR_USR: {{ops_mgr_usr}}
+      OPS_MGR_PWD: {{ops_mgr_pwd}}
+
+      PKS_CLI_USERNAME: {{pks_cli_username}}
+      PKS_CLI_PASSWORD: {{pks_cli_password}}
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pcfnorm/rootfs
+          tag: 1.0.14
+      inputs:
+      - name: terraform-state
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          set -eu
+          PKS_CLI_USEREMAIL="$PKS_CLI_USERNAME@email.com"
+          PKS_API_IP=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.pks-api-ip".primary.attributes.address')
+          PKS_API_DOMAIN=$(echo $PKS_API_IP | tr '.' '-').sslip.io
+          OPSMAN_DOMAIN_OR_IP_ADDRESS=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.ops-manager-public-ip".primary.attributes.address')
+          
+          echo "Retrieving PKS tile properties from Ops Manager [https://$OPSMAN_DOMAIN_OR_IP_ADDRESS]..."
+          
+          # get PKS UAA admin credentails from OpsMgr
+          PRODUCTS=$(om-linux --target "https://$OPSMAN_DOMAIN_OR_IP_ADDRESS"  --username "$OPS_MGR_USR" --password "$OPS_MGR_PWD"  --skip-ssl-validation curl -p /api/v0/staged/products)      
+          PKS_GUID=$(echo "$PRODUCTS" | jq -r '.[] | .guid' | grep pivotal-container-service)
+          PKS_VERSION=$(echo "$PRODUCTS" | jq --arg PKS_GUID "$PKS_GUID" -r '.[] | select(.guid==$PKS_GUID) | .product_version')
+          
+          PKS_API_URL=https://api.${PKS_API_DOMAIN}:9021
+          UAA_URL=https://api.${PKS_API_DOMAIN}:8443
+
+
+          PKS_UAA_ADMIN_SECRET_FIELD=".properties.pks_uaa_management_admin_client"  # for 1.1+
+          if [[ ${PKS_VERSION:0:3} == "1.0" ]]; then
+            PKS_UAA_ADMIN_SECRET_FIELD=".properties.uaa_admin_secret"  # for 1.0.x
+          fi
+
+          UAA_ADMIN_SECRET=$(om-linux --target "https://$OPSMAN_DOMAIN_OR_IP_ADDRESS"  --username "$OPS_MGR_USR" --password "$OPS_MGR_PWD" --skip-ssl-validation curl -p /api/v0/deployed/products/$PKS_GUID/credentials/$PKS_UAA_ADMIN_SECRET_FIELD | jq -rc '.credential.value.secret')
+
+          echo "Connecting to PKS UAA server [<$PKS_API_DOMAIN>]..."
+          # login to PKS UAA
+          uaac target $UAA_URL --skip-ssl-validation
+          uaac token client get admin --secret $UAA_ADMIN_SECRET
+
+          echo "Creating PKS CLI administrator user per PK tile documentation https://docs.pivotal.io/runtimes/pks/1-0/manage-users.html#uaa-scopes"
+          # create pks admin user
+          uaac user add "$PKS_CLI_USERNAME" --emails "$PKS_CLI_USEREMAIL" -p "$PKS_CLI_PASSWORD"
+          uaac member add pks.clusters.admin "$PKS_CLI_USERNAME"
+          uaac member add pks.clusters.manage "$PKS_CLI_USERNAME"
+
+          echo "PKS CLI administrator user [$PKS_CLI_USERNAME] successfully created."
+
+          echo "Next, download the PKS CLI from Pivotal Network and login to the PKS API to create a new K8s cluster [https://docs.pivotal.io/runtimes/pks/1-0/create-cluster.html]"
+          echo "Example: "
+          echo "   pks login -a $UAA_URL -u $PKS_CLI_USERNAME -p <pks-cli-password-provided>"
 
 - name: wipe-env
   build_logs_to_retain: 5
@@ -854,7 +992,7 @@ jobs:
             --request-timeout 900 \
             delete-installation
 
-  - task: terraform-destory
+  - task: terraform-destroy
     params:
       TFVARS: ((tfvars))
     config:
@@ -862,8 +1000,8 @@ jobs:
       image_resource:
         type: docker-image
         source:
-          repository: hashicorp/terraform
-          tag: light
+          repository: pcfnorm/rootfs
+        
       inputs:
       - name: template
       - name: terraform-state
@@ -879,6 +1017,8 @@ jobs:
           cat <<EOF > terraform.tfvars
           ${TFVARS}
           EOF
+
+          cat terraform-state/terraform.tfstate
           terraform init \
                     template
           terraform destroy \
@@ -886,6 +1026,132 @@ jobs:
                     -state terraform-state/terraform.tfstate \
                     -state-out tfstate-output/terraform.tfstate \
                     template 
+
+- name: create-pks-cluster
+  plan:
+  - aggregate:
+    - get: terraform-state
+      passed:
+      - create-pks-cli-user
+      trigger: true
+
+  - task: create-pks-cluster
+    params:
+      PKS_CLI_USERNAME: {{pks_cli_username}}
+      PKS_CLI_PASSWORD: {{pks_cli_password}}
+      GCP_SERVICE_ACCOUNT_KEY: ((gcp_service_account_key))
+      GCP_PROJECT_ID: ((gcp_project_id))
+    config:
+      platform: linux
+      image_resource:
+        type: docker-image
+        source:
+          repository: pivotalservices/pks-kubectl
+      inputs:
+      - name: terraform-state
+      run:
+        path: bash
+        args: 
+        - -c
+        - |
+          set -eu
+          
+          # REALLY NEED A GOOGLE GCLOUD CLI RESOURCE, BUT THIS WILL DO FOR NOW
+          wget -q -O googlecloud.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-214.0.0-linux-x86_64.tar.gz
+          tar xf googlecloud.tar.gz
+          ./google-cloud-sdk/install.sh -q
+          source /tmp/build/*/google-cloud-sdk/path.bash.inc
+          echo $GCP_SERVICE_ACCOUNT_KEY > gcloud.key
+          gcloud auth activate-service-account --key-file=gcloud.key
+          gcloud config set project $GCP_PROJECT_ID
+
+          PKS_API_IP=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_address.pks-api-ip".primary.attributes.address')
+          PKS_DOMAIN=$(echo $PKS_API_IP | tr '.' '-').sslip.io
+          GCP_NETWORK=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_network.pks-network".primary.id')
+          GCP_REGION=$(cat terraform-state/terraform.tfstate | jq -r '.modules[0].resources."google_compute_subnetwork.pks-subnet".primary.attributes.region')
+
+
+          PKS_API_URL="https://api.${PKS_DOMAIN}:9021"
+          CLUSTER_NAME="greenplum"
+          
+          echo "Logging in to PKS API at $PKS_DOMAIN"
+          pks login -k -a ${PKS_API_URL} -u ${PKS_CLI_USERNAME} -p ${PKS_CLI_PASSWORD} --skip-ssl-validation
+          ### Create an external load balancer for \${CLUSTER_NAME} cluster
+          gcloud compute addresses create ${CLUSTER_NAME}-master-api-ip --region ${GCP_REGION}
+          gcloud compute target-pools create ${CLUSTER_NAME}-master-api --region ${GCP_REGION}
+          ### Create a Cluster
+          MASTER_EXTERNAL_IP=$(gcloud compute addresses describe ${CLUSTER_NAME}-master-api-ip --region ${GCP_REGION} --format json | jq -r .address)
+          MASTER_EXTERNAL_HOSTNAME=$(echo $MASTER_EXTERNAL_IP | tr '.' '-').sslip.io
+
+          ### Monitor Cluster Creation and wait for completion
+          
+          echo "Creating PKS cluster $CLUSTER_NAME"
+          echo "Master available at $MASTER_EXTERNAL_IP or $MASTER_EXTERNAL_HOSTNAME"
+          pks create-cluster ${CLUSTER_NAME} -e ${MASTER_EXTERNAL_IP} -p large
+
+          in_progress_state="in progress"
+          succeeded_state="succeeded"
+          cluster_state="$in_progress_state"
+          while [[ "$cluster_state" == "$in_progress_state" ]]; do
+            cluster_state=$(pks cluster "$CLUSTER_NAME" --json | jq -rc '.last_action_state')
+            echo "${cluster_state}..."
+            sleep 10
+          done
+
+          last_action_description=$(pks cluster "$CLUSTER_NAME" --json | jq -rc '.last_action_description')
+
+          if [[ "$cluster_state" == "$succeeded_state" ]]; then
+            echo "Successfully created cluster [$CLUSTER_NAME], last_action_state=[$cluster_state], last_action_description=[$last_action_description]"
+            pks cluster "$CLUSTER_NAME"
+            echo "Next step: make sure that the external hostname configured for the cluster [$MASTER_EXTERNAL_HOSTNAME] is accessible from a DNS/network standpoint, so it can be managed with 'kubectl'"
+          else
+            echo "Error creating cluster [$CLUSTER_NAME], last_action_state=[$cluster_state], last_action_description=[$last_action_description]"
+            exit 1
+          fi
+
+
+          CLUSTER_UUID=$(pks clusters | grep ${CLUSTER_NAME} | awk '{print $3}')
+          MASTER_INSTANCE_NAMES=$(gcloud compute instances list --filter "tags:service-instance-${CLUSTER_UUID}-master" --format "csv[no-heading](selfLink)" | tr '\n' ',' | sed 's/.$//')
+          echo "Creating Load Balancer for ${CLUSTER_NAME}"
+          echo "  - Attaching Masters to Backend: $MASTER_INSTANCE_NAMES"
+          gcloud compute target-pools add-instances ${CLUSTER_NAME}-master-api --instances ${MASTER_INSTANCE_NAMES} 
+          echo "  - Making $MASTER_EXTERNAL_HOSTNAME [$MASTER_EXTERNAL_IP] available via Port 8443"
+          gcloud compute forwarding-rules create ${CLUSTER_NAME}-master-api-8443 --region ${GCP_REGION} --address ${CLUSTER_NAME}-master-api-ip --target-pool ${CLUSTER_NAME}-master-api --ports 8443
+          
+
+          ### Access your cluster
+          echo "Download and install the PKS CLI on you local host"
+          echo;echo;echo;echo "========================================================="
+          echo "LOGIN:  "
+          echo "      pks login -k -a ${PKS_API_URL} -u ${PKS_CLI_USERNAME} -p ${PKS_CLI_PASSWORD} --skip-ssl-validation"
+          echo "PULL CREDENTIALS FROM PKS MASTER: "
+          echo "      pks get-credentials ${CLUSTER_NAME}"
+          echo "TEST CREDENTIALS: "
+          echo "      kubectl cluster-info"
+
+          ### To View Kubernetes Dashboard
+          echo "USE K8S DASHBOARD: "
+          echo "      kubectl proxy"
+          echo "      Browse to: http://127.0.0.1:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 - name: stop-nat
   build_logs_to_retain: 5
@@ -920,7 +1186,6 @@ params:
       type: docker-image
       source:
         repository: pcfnorm/rootfs
-        tag: 1.0.14
     inputs:
     - name: terraform-state
     run:
@@ -946,8 +1211,7 @@ params:
     image_resource:
       type: docker-image
       source:
-        repository: google/cloud-sdk
-        tag: alpine
+        repository: pcfnorm/rootfs
     run:
       path: bash
       args: 
@@ -965,3 +1229,4 @@ params:
           gcloud compute instances ${SUBCMD} ${NAMES[$((i - 1))]} --zone ${ZONES[$((i - 1))]}
         done
         gcloud compute instances list
+
